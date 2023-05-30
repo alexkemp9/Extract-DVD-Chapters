@@ -1,0 +1,95 @@
+#!/bin/bash
+
+set -eo pipefail
+shopt -s expand_aliases
+alias ffmpeg='ffmpeg -hide_banner'
+
+usage()
+{
+cat << EOF
+
+usage: extract-dvd-chapters DVD [TITLE] [CHAPTER_START] [CHAPTER_END]
+
+Rips individual chapters in the given DVD title and encodes each to an x264/aac video.
+
+   DVD              e.g. /dev/sr0 or ISO file. NOTE: don't use mounted ISO mountpoint, lsdvd doesn't like it
+   TITLE            Title to rip (default 1)
+   CHAPTER_START    Chapter to start with, use "-" to merge all chapters in the title to one video (default 1)
+   CHAPTER_END      Chapter to end with, inclusive (default: all chapters in the title)
+
+EOF
+}
+
+if [ -z "$1" ]; then
+  usage
+  exit 2
+fi
+
+
+dvd="$1"
+
+if [ -n "$2" ]; then
+    title_num="$2"
+else
+    # TODO loop through titles
+    # eval $(lsdvd "$dvd" | sed -n 's/Title: \([0-9]\+\), .* Chapters: \([0-9]\+\), Cells: .*/cells[$((10#\1))]=$((10#\2));/p')
+    # titles=${#cells[@]}
+    # for now just:
+    title_num=1
+fi
+
+num_chaps="$(dvdxchap -t $title_num "$dvd"| sed -n 's/^CHAPTER\([0-9]\+\).*/\1/p' | sed -n '$p')"
+
+if [ -n "$3" ]; then
+    from_chap="$3"
+else
+    from_chap=1
+fi
+
+if [ -n "$4" ]; then
+    to_chap="$4"
+else
+    to_chap="$num_chaps"
+fi
+
+if [ "$3" == "-" ]; then
+    merge_chaps=true
+    # only want to loop through once
+    from_chap=1
+    to_chap=1
+fi
+
+if [ "$merge_chaps" = true ] ; then
+    echo -e "\n\n$dvd: Extracting title $title_num, merging chapters"
+else
+    echo -e "\n\n$dvd: Extracting title $title_num chapters $from_chap through $to_chap"
+fi
+
+for ((c=$from_chap; c<=$to_chap; c++)); do
+    # TODO make sure title and chapter are 0-padded for output file name
+    if [ "$merge_chaps" = true ] ; then
+        chaps="1-$num_chaps"
+        output_file="dvd-$title_num.mp4"
+#        output_file="$dvd - $title_num.mp4"
+    else
+        chaps="$c-$c"
+        output_file="dvd-$title_num.$c.mp4"
+#        output_file="$dvd - $title_num.$c.mp4"
+    fi
+
+    echo -e "\n\nEncoding title $title_num chapters $chaps...\n"
+
+    # TODO maybe should automate using `-vf cropdetect` with mplayer and passing crop filter to ffmpeg
+    # mplayer "dvd://$title_num" -dvd-device "$dvd" -chapter "$chaps" -vf cropdetect
+
+    mkfifo fifo
+	 # 2021-09-09 added -noar -noconsolecontrols -nojoystick -nolirc -nomouseinput
+    mplayer -quiet -noar -noconsolecontrols -nojoystick -nolirc -nomouseinput -msglevel all=2 dvd://"$title_num" -dvd-device "$dvd" -chapter "$chaps" -dumpstream -dumpfile fifo &
+    # 2021-09-06 added faststart + force_key_frames (alt: 1:"chapters")
+    ffmpeg -y -i fifo -c:v libx264 -preset slower -crf 20 -c:a aac -vbr 5 -force_key_frames chapters-0.1 -movflags +faststart -loglevel error "$output_file"
+#    ffmpeg -y -i fifo -c:v libx264 -preset slower -crf 20 -c:a libfdk_aac -vbr 5 -loglevel error "$output_file"
+    # 2021-09-10 added set $output_file timestamp to DVD/VIDEO_TS timestamp
+	 DVD_VIDEO_DIR="`findmnt "$dvd" -no TARGET`/VIDEO_TS"
+	 touch "$output_file" -r "$DVD_VIDEO_DIR"
+    rm fifo
+done
